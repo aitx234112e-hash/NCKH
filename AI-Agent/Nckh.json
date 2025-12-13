@@ -1,0 +1,230 @@
+{
+  "name": "Form2 - AI Resilience Agent (fixed)",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "form2/cloud/agent-v2",
+        "httpMethod": "POST",
+        "responseMode": "lastNode"
+      },
+      "name": "Webhook - Form2 Agent",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 220]
+    },
+    {
+      "parameters": {
+        "functionCode": "const p = items[0].json || {};\nconst participant_id = p.participant_id || p.userId || null;\nconst email = p.email || (p.metadata && p.metadata.email) || null;\nconst session_id = p.session_id || `s_${Date.now()}`;\nconst answers = Array.isArray(p.answers) ? p.answers : [];\nconst metadata = (p.metadata && typeof p.metadata === 'object') ? p.metadata : {};\nconst payload = { participant_id, email, session_id, answers, metadata };\nconst global = this.getWorkflowStaticData('global') || {};\nglobal.form2Payload = payload;\nthis.setWorkflowStaticData('global', global);\nreturn [{ json: payload }];"
+      },
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [480, 220]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "authentication": "serviceAccount",
+        "sheetId": "1FMlWiixJyNR4GsZdk7oAwzNlxkGRNB7LfVGh8rOlOho",
+        "range": "Form1",
+        "options": { "useColumnNames": true }
+      },
+      "name": "Get Form1 Data",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "credentials": { "googleServiceAccount": { "id": "39", "name": "Google Service Account account 39" } },
+      "position": [720, 120]
+    },
+    {
+      "parameters": {
+        "functionCode": "const global = this.getWorkflowStaticData('global') || {};\nconst payload = global.form2Payload || {};\nconst rows = items.map(i => i.json || {});\nlet rec = null;\nfor (const r of rows) {\n  const samePid = payload.participant_id && String(r.participant_id) === String(payload.participant_id);\n  const sameEmail = payload.email && String((r.email || '').toLowerCase()) === String((payload.email || '').toLowerCase());\n  if (samePid || sameEmail) { rec = r; break; }\n}\nreturn [{ json: { payload, form1: rec || {}, merged: Object.assign({}, rec || {}, payload || {}) } }];"
+      },
+      "name": "Merge Form1",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [960, 220]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Compute resilience score and label using Form1 baseline and new answers\nconst it = items[0].json || {};\nfunction avgScale(answers){\n  const nums = (answers || [])\n    .filter(a => a && a.type === 'scale')\n    .map(a => {\n      const v = Number(a.value);\n      return isNaN(v) ? null : v;\n    })\n    .filter(v => v !== null);\n  if (!nums.length) return null;\n  return nums.reduce((s, v) => s + v, 0) / nums.length;\n}\nconst baseline = Number(it.form1 && (it.form1.resilience_score || it.form1.baseline_score) ? (it.form1.resilience_score || it.form1.baseline_score) : 0);\nconst currentAvg = avgScale(it.payload && it.payload.answers ? it.payload.answers : []);\nlet currentScore = null;\nif (currentAvg === null) {\n  currentScore = baseline ? Math.round(Number(baseline)) : 0;\n} else {\n  // assume scale is 1-5; convert to 0-100\n  currentScore = Math.round((currentAvg / 5) * 100);\n}\nconst label = currentScore < 40 ? 'low' : (currentScore < 70 ? 'medium' : 'high');\nreturn [{ json: Object.assign({}, it, { resilience_score: currentScore, resilience_label: label }) }];"
+      },
+      "name": "Compute Current Score",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1200, 220]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "authentication": "serviceAccount",
+        "sheetId": "1FMlWiixJyNR4GsZdk7oAwzNlxkGRNB7LfVGh8rOlOho",
+        "range": "Audit",
+        "options": { "valueInputMode": "RAW", "useColumnNames": true, "continueOnFail": true },
+        "columns": [
+          { "name": "timestamp", "value": "={{$now}}" },
+          { "name": "participant_id", "value": "={{$json.payload.participant_id || ''}}" },
+          { "name": "session_id", "value": "={{$json.payload.session_id || ''}}" },
+          { "name": "module", "value": "form2_agent_start" },
+          { "name": "resilience_score", "value": "={{$json.resilience_score || ''}}" },
+          { "name": "resilience_label", "value": "={{$json.resilience_label || ''}}" }
+        ]
+      },
+      "name": "Log Start → Audit",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "credentials": { "googleServiceAccount": { "id": "39", "name": "Google Service Account account 39" } },
+      "position": [1440, 220]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Build prompt for LLM: include Form1 baseline, current score and open answers\nconst it = items[0].json || {};\nconst form1 = it.form1 || {};\nconst openAnswers = (it.payload && Array.isArray(it.payload.answers) ? it.payload.answers : [])\n  .filter(a => a && a.type === 'open')\n  .map(a => `Q:${(a.question_text||'').replace(/\\n/g,' ')}\\nA:${(a.text||'').replace(/\\n/g,' ')}`)\n  .join('\\n---\\n');\nconst summary = {\n  baseline_score: form1.resilience_score || form1.baseline_score || null,\n  baseline_label: form1.resilience_label || null,\n  current_score: it.resilience_score,\n  current_label: it.resilience_label\n};\n// Use compact JSON for embedding safely\nconst safeSummary = JSON.stringify(summary);\nconst safeForm1 = JSON.stringify(form1);\nconst prompt = `You are an AI Resilience Analyst and Recovery Campaign Designer. Given the participant profile: ${safeSummary}. Previous risk factors and protective factors: ${safeForm1}. New open answers:\\n${openAnswers}\\nTask: 1) Analyze change in resilience and emotional state. 2) Return EXACT JSON with keys: analysis { change(summary), sentiment (positive|neutral|negative), severity (0.0-1.0), drivers, barriers, resources, needs_followup (true/false), followup_question }, campaign { campaign_name, objective, key_messages (array), channels (array), timeline (array of phases), actions (array), resources_needed (array), kpis (array) }. Provide concise, actionable items. Do not include any extra text.`;\nreturn [{ json: { participant_id: it.payload && it.payload.participant_id, session_id: it.payload && it.payload.session_id, prompt } }];"
+      },
+      "name": "Build LLM Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1680, 220]
+    },
+    {
+      "parameters": {
+        "requestMethod": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "jsonParameters": true,
+        "headerParametersJson": "={{JSON.stringify({ Authorization: 'Bearer ' + ($env.OPENAI_API_KEY || $env.OPENAI_KEY || ''), 'Content-Type': 'application/json', Accept: 'application/json' })}}",
+        "bodyParametersJson": "={{JSON.stringify({ model: $env.OPENAI_MODEL || 'gpt-4o-mini', messages: [{ role: 'system', content: 'You are a strict JSON-only responder.' }, { role: 'user', content: $json.prompt }], temperature: 0.0, max_tokens: 800 })}}",
+        "options": { "ignoreResponseCode": true }
+      },
+      "name": "Generate Chat Completion - LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1920, 220]
+    },
+    {
+      "parameters": {
+        "functionCode": "function safeParse(t){\n  if (!t || typeof t !== 'string') return {};\n  try { return JSON.parse(t); }\n  catch (e) {\n    try {\n      const m = t.match(/\\{[\\s\\S]*\\}/);\n      if (m && m[0]) return JSON.parse(m[0]);\n    } catch (e2) {}\n    return {};\n  }\n}\nconst r = items[0].json || {};\nconst txt = (((r.choices || [])[0] || {}).message || {}).content || '';\nconst out = safeParse(txt);\nconst defAnalysis = { sentiment: 'neutral', severity: 0.3, drivers: [], barriers: [], resources: [], needs_followup: false, followup_question: 'Bạn cần hỗ trợ gì ngay lúc này?' };\nconst defCampaign = { campaign_name: 'Form2 Resilience Support', objective: 'Nâng cao điểm hồi phục và ổn định cảm xúc', key_messages: ['Bạn không đơn độc','Chúng tôi sẵn sàng hỗ trợ','Hãy kết nối để được tư vấn'], channels: ['SMS','Zalo','Email'], timeline: [{phase:'Tuần 1',action:'Thu thập nhu cầu'},{phase:'Tuần 2',action:'Mời tư vấn'},{phase:'Tuần 3-4',action:'Theo dõi và nhắc lịch'}], actions: ['Liên hệ qua Zalo','Đặt lịch tư vấn','Đánh giá lại sau 2 tuần'], resources_needed: ['Tư vấn viên','Tài liệu hướng dẫn','Kênh liên lạc'], kpis: ['Tỷ lệ phản hồi > 40%','Tỷ lệ tham gia tư vấn > 25%'] };\nconst analysis = (out.analysis && typeof out.analysis === 'object' && Object.keys(out.analysis).length) ? out.analysis : defAnalysis;\nconst campaign = (out.campaign && typeof out.campaign === 'object' && Object.keys(out.campaign).length) ? out.campaign : defCampaign;\nreturn [{ json: { llm_raw: txt, analysis, campaign } }];"
+      },
+      "name": "Parse LLM Output",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2160, 220]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "authentication": "serviceAccount",
+        "sheetId": "1FMlWiixJyNR4GsZdk7oAwzNlxkGRNB7LfVGh8rOlOho",
+        "range": "Audit",
+        "options": { "valueInputMode": "RAW", "useColumnNames": true, "continueOnFail": true },
+        "columns": [
+          { "name": "timestamp", "value": "={{$now}}" },
+          { "name": "participant_id", "value": "={{$items('Compute Current Score')[0].json.payload.participant_id || ''}}" },
+          { "name": "session_id", "value": "={{$items('Compute Current Score')[0].json.payload.session_id || ''}}" },
+          { "name": "module", "value": "form2_agent_llm" },
+          { "name": "analysis", "value": "={{JSON.stringify($json.analysis || {})}}" }
+        ]
+      },
+      "name": "Log LLM → Audit",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "credentials": { "googleServiceAccount": { "id": "39", "name": "Google Service Account account 39" } },
+      "position": [2400, 220]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "authentication": "serviceAccount",
+        "sheetId": "1FMlWiixJyNR4GsZdk7oAwzNlxkGRNB7LfVGh8rOlOho",
+        "range": "Responses",
+        "options": { "valueInputMode": "RAW", "useColumnNames": true, "continueOnFail": true },
+        "columns": [
+          { "name": "timestamp", "value": "={{$now}}" },
+          { "name": "participant_id", "value": "={{$items('Compute Current Score')[0].json.payload.participant_id || ''}}" },
+          { "name": "session_id", "value": "={{$items('Compute Current Score')[0].json.payload.session_id || ''}}" },
+          { "name": "resilience_score", "value": "={{$items('Compute Current Score')[0].json.resilience_score || ''}}" },
+          { "name": "resilience_label", "value": "={{$items('Compute Current Score')[0].json.resilience_label || ''}}" },
+          { "name": "analysis_json", "value": "={{JSON.stringify($items('Parse LLM Output')[0].json.analysis || {})}}" },
+          { "name": "campaign_json", "value": "={{JSON.stringify($items('Parse LLM Output')[0].json.campaign || {})}}" }
+        ]
+      },
+      "name": "Save Full Record → Responses",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "credentials": { "googleServiceAccount": { "id": "39", "name": "Google Service Account account 39" } },
+      "position": [2640, 220]
+    },
+    {
+      "parameters": {
+        "responseCode": 200,
+        "responseMode": "lastNode",
+        "responseData": "={{ { status: 'complete', resilience_score: $items('Compute Current Score')[0].json.resilience_score || 0, resilience_label: $items('Compute Current Score')[0].json.resilience_label || 'unknown', analysis: $items('Parse LLM Output')[0].json.analysis || {}, campaign: $items('Parse LLM Output')[0].json.campaign || {} } }}"
+      },
+      "name": "Return Final API Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2880, 220]
+    },
+    {
+      "parameters": {
+        "path": "form2/cloud/profile-v1",
+        "httpMethod": "GET",
+        "responseMode": "lastNode"
+      },
+      "name": "Webhook - Profile",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 460]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "authentication": "serviceAccount",
+        "sheetId": "1FMlWiixJyNR4GsZdk7oAwzNlxkGRNB7LfVGh8rOlOho",
+        "range": "Form1",
+        "options": { "useColumnNames": true }
+      },
+      "name": "Get Form1 Data (Profile)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "credentials": { "googleServiceAccount": { "id": "39", "name": "Google Service Account account 39" } },
+      "position": [720, 460]
+    },
+    {
+      "parameters": {
+        "functionCode": "const q = items[0].json.query || {};\nconst email = (q.email || '').toLowerCase();\nconst pid = q.participant_id || null;\nconst rows = ($items('Get Form1 Data (Profile)') || []).map(i => i.json || {});\nlet rec = null;\nfor (const r of rows) {\n  const samePid = pid && String(r.participant_id) === String(pid);\n  const sameEmail = email && String((r.email || '').toLowerCase()) === email;\n  if (samePid || sameEmail) { rec = r; break; }\n}\nif (!rec) { return [{ json: { status: 'not_found' } }]; }\nconst baseline = {\n  participant_id: rec.participant_id,\n  email: rec.email || null,\n  resilience_score: rec.resilience_score || rec.baseline_score || null,\n  resilience_label: rec.resilience_label || null,\n  risk_factors: rec.risk_factors || null,\n  protective_factors: rec.protective_factors || null\n};\nreturn [{ json: { status: 'ok', baseline } }];"
+      },
+      "name": "Find Form1 by Query",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [960, 460]
+    },
+    {
+      "parameters": {
+        "responseCode": 200,
+        "responseMode": "lastNode",
+        "responseData": "={{$json}}"
+      },
+      "name": "Return Profile",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1200, 460]
+    }
+  ],
+  "connections": {
+    "Webhook - Form2 Agent": { "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]] },
+    "Normalize Input": { "main": [[{ "node": "Get Form1 Data", "type": "main", "index": 0 }]] },
+    "Get Form1 Data": { "main": [[{ "node": "Merge Form1", "type": "main", "index": 0 }]] },
+    "Merge Form1": { "main": [[{ "node": "Compute Current Score", "type": "main", "index": 0 }]] },
+    "Compute Current Score": { "main": [[{ "node": "Log Start → Audit", "type": "main", "index": 0 }, { "node": "Build LLM Prompt", "type": "main", "index": 0 }]] },
+    "Log Start → Audit": { "main": [[{ "node": "Build LLM Prompt", "type": "main", "index": 0 }]] },
+    "Build LLM Prompt": { "main": [[{ "node": "Generate Chat Completion - LLM", "type": "main", "index": 0 }]] },
+    "Generate Chat Completion - LLM": { "main": [[{ "node": "Parse LLM Output", "type": "main", "index": 0 }]] },
+    "Parse LLM Output": { "main": [[{ "node": "Log LLM → Audit", "type": "main", "index": 0 }, { "node": "Save Full Record → Responses", "type": "main", "index": 0 }]] },
+    "Log LLM → Audit": { "main": [[{ "node": "Save Full Record → Responses", "type": "main", "index": 0 }]] },
+    "Save Full Record → Responses": { "main": [[{ "node": "Return Final API Response", "type": "main", "index": 0 }]] },
+    "Webhook - Profile": { "main": [[{ "node": "Get Form1 Data (Profile)", "type": "main", "index": 0 }]] },
+    "Get Form1 Data (Profile)": { "main": [[{ "node": "Find Form1 by Query", "type": "main", "index": 0 }]] },
+    "Find Form1 by Query": { "main": [[{ "node": "Return Profile", "type": "main", "index": 0 }]] }
+  },
+  "active": true,
+  "settings": {},
+  "versionId": "1.0.0-form2-agent-fixed"
+}

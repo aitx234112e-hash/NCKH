@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Khảo sát Form 2 – Mời tham gia</title>
+  <style>
+    body{font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#f7f7f8;color:#111}
+    .wrap{max-width:760px;margin:48px auto;padding:28px;background:linear-gradient(180deg,#ffffff,#fbfbff);border:1px solid #e6e6eb;border-radius:16px;box-shadow:0 12px 34px rgba(29,41,57,0.08)}
+    h1{font-size:24px;margin:0 0 12px}
+    p{margin:8px 0}
+    label{display:block;margin:14px 0 6px;font-weight:600}
+    input,textarea,select{width:100%;padding:12px;border:1px solid #cad2e0;border-radius:10px;font-size:14px;background:#fff}
+    button{background:#2f67ff;color:#fff;border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer}
+    .row{display:flex;gap:12px}
+    .row>div{flex:1}
+    .note{font-size:12px;color:#666}
+    .ok{color:#0a7c2f}
+    .err{color:#b00020}
+    .card{border:1px dashed #c9d1e6;border-radius:12px;padding:12px;margin:12px 0;background:#f7f9ff}
+    .muted{color:#444}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 style="background:linear-gradient(90deg,#6b8cff,#9cc8ff);-webkit-background-clip:text;background-clip:text;color:transparent">Khảo sát Form 2</h1>
+    <p class="muted">Xác nhận email/mã của bạn để hệ thống AI cập nhật hồ sơ và hiển thị chiến dịch cá nhân hóa ngay sau khi gửi.</p>
+    <div class="card" id="baseline" style="display:none"></div>
+    <form id="f">
+      <label>Email đã khảo sát Form 1</label>
+      <input id="email" type="email" required placeholder="vd: user@example.com">
+      <label>Mã người tham gia</label>
+      <input id="pid" name="participant_id" placeholder="vd: u_123">
+      <div class="row">
+        <div>
+          <label>Mã phiên</label>
+          <input id="sid" name="session_id" placeholder="vd: s_456">
+        </div>
+        <div>
+          <label>Mức độ hồi phục hiện tại</label>
+          <select id="recov" name="recovery_now">
+            <option value="">Chọn</option>
+            <option value="1">1 - Rất thấp</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5">5 - Rất cao</option>
+          </select>
+        </div>
+      </div>
+      <label>Khó khăn lớn nhất hiện tại</label>
+      <textarea id="open1" rows="4" placeholder="Mô tả ngắn"></textarea>
+      <p class="note">Nút Gửi sẽ gửi dữ liệu đến hệ thống n8n để phân tích và thiết kế chiến dịch phục hồi.</p>
+      <button type="submit">Gửi khảo sát Form 2</button>
+      <p class="note" id="delta" style="display:none"></p>
+    </form>
+    <p id="out" class="note"></p>
+    <div id="campaignView" style="display:none">
+      <h2 style="font-size:18px;margin:16px 0">Chiến dịch cá nhân hóa</h2>
+      <div class="card" id="c-summary"></div>
+      <div class="card" id="c-messages"></div>
+      <div class="card" id="c-channels"></div>
+      <div class="card" id="c-timeline"></div>
+      <div class="card" id="c-actions"></div>
+      <div class="card" id="c-resources"></div>
+      <div class="card" id="c-kpis"></div>
+    </div>
+  </div>
+  <script>
+    const N8N_BASE = (window.N8N_BASE||'https://YOUR-N8N-DOMAIN');
+    const ENDPOINT = N8N_BASE + '/webhook/form2/cloud/agent-v2';
+    const PROFILE = N8N_BASE + '/webhook/form2/cloud/profile-v1';
+    let baselineScore = null;
+    function payload(){
+      const pid = document.getElementById('pid').value.trim();
+      const email = document.getElementById('email').value.trim();
+      const sid = document.getElementById('sid').value.trim() || ('s_'+Date.now());
+      const rec = document.getElementById('recov').value;
+      const open1 = document.getElementById('open1').value.trim();
+      const answers = [];
+      if (rec) answers.push({question_id:'recovery_now',question_text:'Mức độ hồi phục hiện tại',type:'scale',value:Number(rec),scale_max:5});
+      if (open1) answers.push({question_id:'biggest_barrier',question_text:'Khó khăn lớn nhất hiện tại',type:'open',text:open1});
+      return {participant_id:pid,email,session_id:sid,answers,metadata:{channel:'web_html',email}};
+    }
+    async function prefillFromQuery(){
+      const params = new URLSearchParams(location.search);
+      const email = params.get('email');
+      const pid = params.get('participant_id');
+      if (email) document.getElementById('email').value = email;
+      if (pid) document.getElementById('pid').value = pid;
+      if (email || pid){
+        try{
+          const url = PROFILE + '?' + new URLSearchParams({email,participant_id:pid}).toString();
+          const r = await fetch(url);
+          const j = await r.json();
+          if (j.status==='ok'){
+            const el = document.getElementById('baseline');
+            el.style.display='block';
+            el.innerHTML = `<div class="muted">Hồ sơ Form 1</div>
+              <div>Email: <b>${j.baseline.email||'-'}</b> · Mã: <b>${j.baseline.participant_id||'-'}</b></div>
+              <div>Điểm hồi phục nền: <b>${j.baseline.resilience_score??'-'}</b> · Nhãn: <b>${j.baseline.resilience_label||'-'}</b></div>`;
+            baselineScore = j.baseline.resilience_score ?? null;
+            if (!document.getElementById('pid').value && j.baseline.participant_id){
+              document.getElementById('pid').value = j.baseline.participant_id;
+            }
+          }
+        }catch(e){ /* silent */ }
+      }
+    }
+    prefillFromQuery();
+    document.getElementById('f').addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const data = payload();
+      const out = document.getElementById('out');
+      out.textContent = 'Đang gửi...'; out.className = 'note';
+      try {
+        const res = await fetch(ENDPOINT,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+        const j = await res.json().catch(()=>({status:'ok'}));
+        out.textContent = 'Đã gửi thành công. Điểm phục hồi: '+(j.resilience_score??'-')+' / Nhãn: '+(j.resilience_label??'-');
+        out.className = 'note ok';
+        const d = document.getElementById('delta');
+        if (baselineScore!=null && j.resilience_score!=null){
+          const diff = Number(j.resilience_score) - Number(baselineScore);
+          d.style.display = 'block';
+          d.textContent = 'Thay đổi so với Form 1: '+(diff>0?'+':'')+diff;
+        }
+        const cv = document.getElementById('campaignView');
+        const c = j.campaign||{};
+        if (Object.keys(c).length){
+          cv.style.display='block';
+          document.getElementById('c-summary').innerHTML = `<div class="muted">Mục tiêu</div><div><b>${c.objective||'-'}</b></div><div>Tên chiến dịch: <b>${c.campaign_name||'-'}</b></div><div>Điểm/Nhãn: <b>${j.resilience_score??'-'}</b> · <b>${j.resilience_label||'-'}</b></div>`;
+          const msgs = Array.isArray(c.key_messages)?c.key_messages:[];
+          document.getElementById('c-messages').innerHTML = `<div class="muted">Thông điệp chính</div>${msgs.map(m=>`<div>• ${m}</div>`).join('')}`;
+          const ch = Array.isArray(c.channels)?c.channels:[];
+          document.getElementById('c-channels').innerHTML = `<div class="muted">Kênh triển khai</div>${ch.map(x=>`<span style="display:inline-block;background:#e7edff;color:#163bff;padding:6px 10px;border-radius:999px;margin:4px 6px">${x}</span>`).join('')}`;
+          const tl = Array.isArray(c.timeline)?c.timeline:[];
+          document.getElementById('c-timeline').innerHTML = `<div class="muted">Lộ trình</div>${tl.map(t=>`<div>• ${t.phase||''}: ${t.action||''}</div>`).join('')}`;
+          const act = Array.isArray(c.actions)?c.actions:[];
+          document.getElementById('c-actions').innerHTML = `<div class="muted">Hành động</div>${act.map(a=>`<div>• ${a}</div>`).join('')}`;
+          const res = Array.isArray(c.resources_needed)?c.resources_needed:[];
+          document.getElementById('c-resources').innerHTML = `<div class="muted">Nguồn lực cần</div>${res.map(r=>`<div>• ${r}</div>`).join('')}`;
+          const kpis = Array.isArray(c.kpis)?c.kpis:[];
+          document.getElementById('c-kpis').innerHTML = `<div class="muted">KPIs</div>${kpis.map(k=>`<div>• ${k}</div>`).join('')}`;
+        }
+      } catch(err){
+        out.textContent = 'Gửi thất bại. Vui lòng thử lại hoặc liên hệ hỗ trợ.';
+        out.className = 'note err';
+      }
+    });
+  </script>
+</body>
+</html>
